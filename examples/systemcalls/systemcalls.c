@@ -1,4 +1,7 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -17,7 +20,7 @@ bool do_system(const char *cmd)
  *   or false() if it returned a failure
 */
 
-    return true;
+    return system(cmd) == 0;
 }
 
 /**
@@ -47,7 +50,21 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    
+    pid_t pid = fork();
+    int status;
+
+    if (pid < 0)
+    {
+        va_end(args);
+        return false;
+    }
+
+    if (pid == 0)
+    {
+        execv(command[0], command);
+        exit(1);
+    }
 
 /*
  * TODO:
@@ -58,10 +75,19 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    if (waitpid(pid, &status, 0) < 0)
+{
+    va_end(args);
+    return false;
+}
 
     va_end(args);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    {
+        return true;
+    }
 
-    return true;
+    return false;
 }
 
 /**
@@ -80,20 +106,40 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
+    pid_t pid = fork();
+    int status;
 
+    if (pid < 0)
+    {
+        va_end(args);
+        return false;
+    }
 
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
+    if (pid == 0)
+    {
+        FILE *file = freopen(outputfile, "w", stdout);
+
+        if (file == NULL)
+        {
+            exit(1);
+        }
+
+        execv(command[0], command);
+        exit(1);
+    }
+
+    if (waitpid(pid, &status, 0) < 0)
+    {
+        va_end(args);
+        return false;
+    }
 
     va_end(args);
 
-    return true;
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+    {
+        return true;
+    }
+
+    return false;
 }
