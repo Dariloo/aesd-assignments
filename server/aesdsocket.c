@@ -53,6 +53,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    int opt = 1;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
+    {
+        perror("setsockopt");
+        close(sockfd);
+        return 1;
+    }
+
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(9000);
     server_addr.sin_addr.s_addr = INADDR_ANY;
