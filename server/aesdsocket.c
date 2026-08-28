@@ -6,6 +6,23 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <errno.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <sys/queue.h>
+#include <time.h>
+
+struct client_thread
+{
+    pthread_t thread;
+    int client_fd;
+    bool complete;
+
+    SLIST_ENTRY(client_thread) entries;
+};
+
+SLIST_HEAD(thread_list, client_thread);
+
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 volatile sig_atomic_t stop = 0;
 
@@ -14,19 +31,180 @@ void signal_handler(int signo)
     stop = 1;
 }
 
+void *client_thread_func(void *arg)
+{
+    struct client_thread *data = (struct client_thread *)arg;
+
+    char buffer[1024];
+    char *message = NULL;
+    size_t message_size = 0;
+    ssize_t bytes_received;
+
+    data->complete = false;
+
+    while (1)
+    {
+        bytes_received = recv(data->client_fd,
+                              buffer,
+                              sizeof(buffer),
+                              0);
+
+        if (bytes_received < 0)
+        {
+            perror("recv");
+            break;
+        }
+
+        if (bytes_received == 0)
+        {
+            break;
+        }
+
+        char *temp;
+
+        temp = realloc(message,
+                       message_size + bytes_received + 1);
+
+        if (temp == NULL)
+        {
+            free(message);
+            message = NULL;
+            break;
+        }
+
+        message = temp;
+
+        memcpy(message + message_size,
+               buffer,
+               bytes_received);
+
+        message_size += bytes_received;
+        message[message_size] = '\0';
+
+        if (strchr(message, '\n') != NULL)
+        {
+            break;
+        }
+    }
+
+    if (message != NULL)
+    {
+        pthread_mutex_lock(&file_mutex);
+
+        FILE *file = fopen("/var/tmp/aesdsocketdata", "a+");
+
+        if (file != NULL)
+        {
+            fwrite(message, 1, message_size, file);
+            fflush(file);
+
+            rewind(file);
+
+            size_t bytes_read;
+
+            while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0)
+            {
+                size_t total_sent = 0;
+
+                while (total_sent < bytes_read)
+                {
+                    ssize_t bytes_sent;
+
+                    bytes_sent = send(data->client_fd,
+                                      buffer + total_sent,
+                                      bytes_read - total_sent,
+                                      0);
+
+                    if (bytes_sent <= 0)
+                    {
+                        break;
+                    }
+
+                    total_sent += bytes_sent;
+                }
+            }
+
+            fclose(file);
+        }
+        else
+        {
+            perror("fopen");
+        }
+
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    free(message);
+    close(data->client_fd);
+
+    data->complete = true;
+
+    return NULL;
+}
+
+void *timestamp_thread_func(void *arg)
+{
+    int i;
+
+    while (!stop)
+    {
+        for (i = 0; i < 10 && !stop; i++)
+        {
+            sleep(1);
+        }
+
+        if (stop)
+        {
+            break;
+        }
+
+        time_t now;
+        struct tm *time_info;
+        char timestamp[128];
+
+        now = time(NULL);
+        time_info = localtime(&now);
+
+        if (time_info == NULL)
+        {
+            continue;
+        }
+
+        strftime(timestamp,
+                 sizeof(timestamp),
+                 "timestamp:%a, %d %b %Y %H:%M:%S %z\n",
+                 time_info);
+
+        pthread_mutex_lock(&file_mutex);
+
+        FILE *file = fopen("/var/tmp/aesdsocketdata", "a");
+
+        if (file != NULL)
+        {
+            fputs(timestamp, file);
+            fclose(file);
+        }
+
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
 int main(int argc, char *argv[])
 {
     int sockfd;
     int client_fd;
-    char buffer[1024];
-    ssize_t bytes_received;
-
-    char *all_data = NULL;
-    size_t all_data_size = 0;
 
     struct sockaddr_in server_addr = {0};
     struct sockaddr_in client_addr = {0};
     socklen_t client_addr_len;
+
+    struct thread_list threads;
+    SLIST_INIT(&threads);
+
+    pthread_t timestamp_thread;
+    bool timestamp_thread_started = false;
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0)
     {
@@ -80,11 +258,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (pthread_create(&timestamp_thread,
+                       NULL,
+                       timestamp_thread_func,
+                       NULL) != 0)
+    {
+        perror("pthread_create");
+        close(sockfd);
+        return 1;
+    }
+
+    timestamp_thread_started = true;
+
     while (!stop)
     {
-        char *message = NULL;
-        size_t message_size = 0;
-
         client_addr_len = sizeof(client_addr);
 
         client_fd = accept(sockfd,
@@ -102,95 +289,84 @@ int main(int argc, char *argv[])
             break;
         }
 
-        while (1)
+        struct client_thread *data;
+
+        data = malloc(sizeof(struct client_thread));
+
+        if (data == NULL)
         {
-            bytes_received = recv(client_fd,
-                                  buffer,
-                                  sizeof(buffer),
-                                  0);
-
-            if (bytes_received < 0)
-            {
-                perror("recv");
-                break;
-            }
-
-            if (bytes_received == 0)
-            {
-                break;
-            }
-
-            char *temp;
-
-            temp = realloc(message,
-                           message_size + bytes_received + 1);
-
-            if (temp == NULL)
-            {
-                free(message);
-                message = NULL;
-                break;
-            }
-
-            message = temp;
-
-            memcpy(message + message_size,
-                   buffer,
-                   bytes_received);
-
-            message_size += bytes_received;
-            message[message_size] = '\0';
-
-            if (strchr(message, '\n') != NULL)
-            {
-                break;
-            }
+            close(client_fd);
+            continue;
         }
 
-        if (message != NULL)
+        data->client_fd = client_fd;
+        data->complete = false;
+
+        if (pthread_create(&data->thread,
+                           NULL,
+                           client_thread_func,
+                           data) != 0)
         {
-            char *temp;
-
-            temp = realloc(all_data,
-                           all_data_size + message_size);
-
-            if (temp != NULL)
-            {
-                all_data = temp;
-
-                memcpy(all_data + all_data_size,
-                       message,
-                       message_size);
-
-                all_data_size += message_size;
-
-                size_t total_sent = 0;
-
-                while (total_sent < all_data_size)
-                {
-                    ssize_t bytes_sent;
-
-                    bytes_sent = send(client_fd,
-                                      all_data + total_sent,
-                                      all_data_size - total_sent,
-                                      0);
-
-                    if (bytes_sent <= 0)
-                    {
-                        break;
-                    }
-
-                    total_sent += bytes_sent;
-                }
-            }
+            close(client_fd);
+            free(data);
+            continue;
         }
 
-        free(message);
-        close(client_fd);
+        SLIST_INSERT_HEAD(&threads, data, entries);
+
+        struct client_thread *current;
+        struct client_thread *next;
+
+        current = SLIST_FIRST(&threads);
+
+        while (current != NULL)
+        {
+            next = SLIST_NEXT(current, entries);
+
+            if (current->complete)
+            {
+                pthread_join(current->thread, NULL);
+
+                SLIST_REMOVE(&threads,
+                             current,
+                             client_thread,
+                             entries);
+
+                free(current);
+            }
+
+            current = next;
+        }
     }
 
-    free(all_data);
     close(sockfd);
+
+    struct client_thread *current;
+
+    while (!SLIST_EMPTY(&threads))
+    {
+        current = SLIST_FIRST(&threads);
+
+        if (!current->complete)
+        {
+            shutdown(current->client_fd, SHUT_RDWR);
+        }
+
+        pthread_join(current->thread, NULL);
+
+        SLIST_REMOVE_HEAD(&threads, entries);
+
+        free(current);
+    }
+
+    if (timestamp_thread_started)
+    {
+        pthread_join(timestamp_thread, NULL);
+    }
+
+    remove("/var/tmp/aesdsocketdata");
+
+    pthread_mutex_destroy(&file_mutex);
 
     return 0;
 }
