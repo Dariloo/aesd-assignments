@@ -10,6 +10,17 @@
 #include <stdbool.h>
 #include <sys/queue.h>
 #include <time.h>
+#include <fcntl.h>
+
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define DATA_PATH "/dev/aesdchar"
+#else
+#define DATA_PATH "/var/tmp/aesdsocketdata"
+#endif
 
 struct client_thread
 {
@@ -22,7 +33,9 @@ struct client_thread
 
 SLIST_HEAD(thread_list, client_thread);
 
+#if !USE_AESD_CHAR_DEVICE
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 volatile sig_atomic_t stop = 0;
 
@@ -89,9 +102,74 @@ void *client_thread_func(void *arg)
 
     if (message != NULL)
     {
+#if USE_AESD_CHAR_DEVICE
+        int file_fd = open(DATA_PATH, O_RDWR);
+
+        if (file_fd != -1)
+        {
+            size_t total_written = 0;
+
+            while (total_written < message_size)
+            {
+                ssize_t bytes_written;
+
+                bytes_written = write(file_fd,
+                                      message + total_written,
+                                      message_size - total_written);
+
+                if (bytes_written <= 0)
+                {
+                    perror("write");
+                    break;
+                }
+
+                total_written += bytes_written;
+            }
+
+            if (total_written == message_size)
+            {
+                ssize_t bytes_read;
+
+                while ((bytes_read = read(file_fd,
+                                          buffer,
+                                          sizeof(buffer))) > 0)
+                {
+                    size_t total_sent = 0;
+
+                    while (total_sent < (size_t)bytes_read)
+                    {
+                        ssize_t bytes_sent;
+
+                        bytes_sent = send(data->client_fd,
+                                          buffer + total_sent,
+                                          bytes_read - total_sent,
+                                          0);
+
+                        if (bytes_sent <= 0)
+                        {
+                            break;
+                        }
+
+                        total_sent += bytes_sent;
+                    }
+                }
+
+                if (bytes_read < 0)
+                {
+                    perror("read");
+                }
+            }
+
+            close(file_fd);
+        }
+        else
+        {
+            perror("open");
+        }
+#else
         pthread_mutex_lock(&file_mutex);
 
-        FILE *file = fopen("/var/tmp/aesdsocketdata", "a+");
+        FILE *file = fopen(DATA_PATH, "a+");
 
         if (file != NULL)
         {
@@ -132,6 +210,7 @@ void *client_thread_func(void *arg)
         }
 
         pthread_mutex_unlock(&file_mutex);
+#endif
     }
 
     free(message);
@@ -142,6 +221,7 @@ void *client_thread_func(void *arg)
     return NULL;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 void *timestamp_thread_func(void *arg)
 {
     int i;
@@ -177,7 +257,7 @@ void *timestamp_thread_func(void *arg)
 
         pthread_mutex_lock(&file_mutex);
 
-        FILE *file = fopen("/var/tmp/aesdsocketdata", "a");
+        FILE *file = fopen(DATA_PATH, "a");
 
         if (file != NULL)
         {
@@ -190,6 +270,7 @@ void *timestamp_thread_func(void *arg)
 
     return NULL;
 }
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -203,8 +284,10 @@ int main(int argc, char *argv[])
     struct thread_list threads;
     SLIST_INIT(&threads);
 
+#if !USE_AESD_CHAR_DEVICE
     pthread_t timestamp_thread;
     bool timestamp_thread_started = false;
+#endif
 
     if (argc == 2 && strcmp(argv[1], "-d") == 0)
     {
@@ -233,7 +316,11 @@ int main(int argc, char *argv[])
 
     int opt = 1;
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1)
+    if (setsockopt(sockfd,
+                   SOL_SOCKET,
+                   SO_REUSEADDR,
+                   &opt,
+                   sizeof(opt)) == -1)
     {
         perror("setsockopt");
         close(sockfd);
@@ -244,7 +331,9 @@ int main(int argc, char *argv[])
     server_addr.sin_port = htons(9000);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) == -1)
+    if (bind(sockfd,
+             (struct sockaddr *)&server_addr,
+             sizeof(server_addr)) == -1)
     {
         perror("bind");
         close(sockfd);
@@ -258,6 +347,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (pthread_create(&timestamp_thread,
                        NULL,
                        timestamp_thread_func,
@@ -269,6 +359,7 @@ int main(int argc, char *argv[])
     }
 
     timestamp_thread_started = true;
+#endif
 
     while (!stop)
     {
@@ -359,14 +450,16 @@ int main(int argc, char *argv[])
         free(current);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (timestamp_thread_started)
     {
         pthread_join(timestamp_thread, NULL);
     }
 
-    remove("/var/tmp/aesdsocketdata");
+    remove(DATA_PATH);
 
     pthread_mutex_destroy(&file_mutex);
+#endif
 
     return 0;
 }
