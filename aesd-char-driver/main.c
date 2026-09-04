@@ -20,6 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/string.h>
 #include "aesdchar.h"
 
 int aesd_major =   0; // use dynamic major
@@ -103,8 +104,9 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 {
     ssize_t retval = -ENOMEM;
     struct aesd_dev *dev = filp->private_data;
-    struct aesd_buffer_entry entry;
     char *data;
+    size_t old_size;
+    size_t new_size;
 
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
     /**
@@ -113,25 +115,40 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    data = kmalloc(count, GFP_KERNEL);
+    old_size = dev->pending_entry.size;
+    new_size = old_size + count;
+
+    data = kmalloc(new_size, GFP_KERNEL);
     if (!data) {
         mutex_unlock(&dev->lock);
         return -ENOMEM;
     }
 
-    if (copy_from_user(data, buf, count)) {
+    if (old_size)
+        memcpy(data, dev->pending_entry.buffptr, old_size);
+
+    if (copy_from_user(data + old_size, buf, count)) {
         kfree(data);
         mutex_unlock(&dev->lock);
         return -EFAULT;
     }
 
-    if (dev->buffer.full)
-        kfree(dev->buffer.entry[dev->buffer.in_offs].buffptr);
+    kfree(dev->pending_entry.buffptr);
 
-    entry.buffptr = data;
-    entry.size = count;
+    dev->pending_entry.buffptr = data;
+    dev->pending_entry.size = new_size;
 
-    aesd_circular_buffer_add_entry(&dev->buffer, &entry);
+    if (memchr(data, '\n', new_size)) {
+
+        if (dev->buffer.full)
+            kfree(dev->buffer.entry[dev->buffer.in_offs].buffptr);
+
+        aesd_circular_buffer_add_entry(
+            &dev->buffer, &dev->pending_entry);
+
+        dev->pending_entry.buffptr = NULL;
+        dev->pending_entry.size = 0;
+    }
 
     retval = count;
 
@@ -182,6 +199,8 @@ int aesd_init_module(void)
      * TODO: initialize the AESD specific portion of the device
      */
     aesd_circular_buffer_init(&aesd_device.buffer);
+    aesd_device.pending_entry.buffptr = NULL;
+    aesd_device.pending_entry.size = 0;
     mutex_init(&aesd_device.lock);
 
     result = aesd_setup_cdev(&aesd_device);
@@ -204,6 +223,8 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+    kfree(aesd_device.pending_entry.buffptr);
+
     AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index) {
         kfree(entry->buffptr);
     }
