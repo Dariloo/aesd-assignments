@@ -11,6 +11,7 @@
 #include <sys/queue.h>
 #include <time.h>
 #include <fcntl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
@@ -107,26 +108,66 @@ void *client_thread_func(void *arg)
 
         if (file_fd != -1)
         {
-            size_t total_written = 0;
+            bool ready_to_read = false;
+            unsigned int write_cmd;
+            unsigned int write_cmd_offset;
 
-            while (total_written < message_size)
+            if (sscanf(message,
+                       "AESDCHAR_IOCSEEKTO:%u,%u",
+                       &write_cmd,
+                       &write_cmd_offset) == 2)
             {
-                ssize_t bytes_written;
+                struct aesd_seekto seekto;
 
-                bytes_written = write(file_fd,
-                                      message + total_written,
-                                      message_size - total_written);
+                seekto.write_cmd = write_cmd;
+                seekto.write_cmd_offset = write_cmd_offset;
 
-                if (bytes_written <= 0)
+                if (ioctl(file_fd,
+                          AESDCHAR_IOCSEEKTO,
+                          &seekto) == -1)
                 {
-                    perror("write");
-                    break;
+                    perror("ioctl");
+                }
+                else
+                {
+                    ready_to_read = true;
+                }
+            }
+            else
+            {
+                size_t total_written = 0;
+
+                while (total_written < message_size)
+                {
+                    ssize_t bytes_written;
+
+                    bytes_written = write(file_fd,
+                                          message + total_written,
+                                          message_size - total_written);
+
+                    if (bytes_written <= 0)
+                    {
+                        perror("write");
+                        break;
+                    }
+
+                    total_written += bytes_written;
                 }
 
-                total_written += bytes_written;
+                if (total_written == message_size)
+                {
+                    if (lseek(file_fd, 0, SEEK_SET) == -1)
+                    {
+                        perror("lseek");
+                    }
+                    else
+                    {
+                        ready_to_read = true;
+                    }
+                }
             }
 
-            if (total_written == message_size)
+            if (ready_to_read)
             {
                 ssize_t bytes_read;
 
