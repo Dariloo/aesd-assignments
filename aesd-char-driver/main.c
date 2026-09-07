@@ -22,6 +22,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
@@ -179,6 +180,54 @@ loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
     return retval;
 }
 
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seekto;
+    uint8_t index;
+    uint8_t i;
+    uint8_t count;
+    loff_t new_pos = 0;
+
+    if (cmd != AESDCHAR_IOCSEEKTO)
+        return -ENOTTY;
+
+    if (copy_from_user(&seekto, (const void __user *)arg, sizeof(seekto)))
+        return -EFAULT;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    if (dev->buffer.full)
+        count = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    else
+        count = dev->buffer.in_offs;
+
+    if (seekto.write_cmd >= count) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    index = dev->buffer.out_offs;
+
+    for (i = 0; i < seekto.write_cmd; i++) {
+        new_pos += dev->buffer.entry[index].size;
+        index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    if (seekto.write_cmd_offset >= dev->buffer.entry[index].size) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    new_pos += seekto.write_cmd_offset;
+    filp->f_pos = new_pos;
+
+    mutex_unlock(&dev->lock);
+
+    return 0;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
@@ -186,6 +235,7 @@ struct file_operations aesd_fops = {
     .open =     aesd_open,
     .release =  aesd_release,
     .llseek =   aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
